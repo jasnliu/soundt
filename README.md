@@ -4,11 +4,14 @@ This is a small, local Python program for detecting a particular percussive
 sound, including a cymbal hit. It does not use a pretrained drum classifier.
 Instead, it learns a profile from recordings you provide.
 
-The detector uses two checks:
+The detector uses three checks:
 
-1. The signal must contain a sudden broadband attack above the recent noise floor.
-2. The attack and its first 240 ms must resemble the enrolled examples by
+1. The signal must contain broadband energy that cannot be explained by the
+   currently predicted resonance decay.
+2. The residual attack and its first 240 ms must resemble the enrolled examples by
    frequency-specific decay, spectral shape, envelope, and timbre.
+3. A hit on top of active resonance must also match a stricter 75 ms residual
+   attack fingerprint and the enrolled decay envelope.
 
 The detector is intentionally looking for the start of a hit. A cymbal's
 continuing resonance is not treated as a new hit: enrollment fingerprints are
@@ -151,10 +154,9 @@ Then pass its numeric ID or name:
 python sound_detector.py listen --profile hit.json --device 2
 ```
 
-The listener keeps a short alignment buffer, waits roughly 250 ms after a
+The listener keeps a short alignment buffer, waits roughly 300 ms after a
 candidate onset, then prints a detection after classifying the attack and early
-decay. The
-first half-second is used to measure the room and produces no detections. The
+decay. The first half-second is used to measure the room and produces no detections. The
 default 4 dB loudness jump and 0.72 similarity threshold are starting points.
 The identity fingerprint—not volume—is what should accept or reject a
 candidate. Clips shorter than 160 ms are refused because they discard the
@@ -166,26 +168,26 @@ or quiet playing, these controls make the onset gate more responsive:
 
 ```bash
 python sound_detector.py listen --profile hit.json \
-  --min-gap-ms 45 --jump-db 3 --rise-db 3 --min-dbfs -68 --verbose
+  --min-gap-ms 35 --block-ms 4 --jump-db 3 --min-dbfs -68 --verbose
 ```
 
-`--min-gap-ms` is the shortest allowed time between candidate hits.
-`--rise-db` is the short-term increase that marks a new attack. Spectral flux is
-also required, which helps reject gradual cymbal resonance. Lower either
-value carefully if hits are missed; the fingerprint still decides whether each
-candidate is the enrolled sound.
+`--min-gap-ms` is the shortest allowed time between candidates, and `--block-ms`
+controls live analysis resolution. While a cymbal is ringing, the detector
+predicts its per-band decay and searches the unexplained residual for another
+attack instead of requiring the total sound to become quiet first. Do not lower
+the identity threshold merely to find consecutive hits; overlap detection has
+its own guarded identity, attack, and envelope checks.
 
-For 200 ms after a candidate hit, the detector applies a stricter 5 dB rise
-requirement. This rejects low-rise decay and reverb without blocking a genuinely
-sharp following hit. Change it with `--post-hit-rise-db` if necessary.
-
-Profiles created with older versions must be re-enrolled. Version 4 profiles
-use corrected attack alignment and retain early decay and timbre information;
-rejection data can only lower a candidate's score, never raise it.
+Profiles created with older versions must be re-enrolled. Version 5 profiles
+contain both the full identity fingerprint and a short residual-attack
+fingerprint used for consecutive hits. Rejection data can only lower a
+candidate's score, never raise it.
 
 ## Limitations
 
 - Enrollment assumes one main hit per example recording.
+- Hits closer than roughly 100-120 ms may merge acoustically and be counted as
+  one event; the exact limit depends on strike strength and microphone placement.
 - The profile is intentionally specific to the sound and recording setup; if
   the microphone or room changes substantially, enroll a few new examples.
 - `sounddevice` is needed only for `listen`; file enrollment and scanning need

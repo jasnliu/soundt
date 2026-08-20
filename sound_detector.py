@@ -33,19 +33,23 @@ import numpy as np
 
 
 DEFAULT_SAMPLE_RATE = 16_000
-DEFAULT_CLIP_SECONDS = 0.24
-DEFAULT_PRE_SECONDS = 0.008
+DEFAULT_CLIP_SECONDS = 0.30
+DEFAULT_PRE_SECONDS = 0.060
 DEFAULT_THRESHOLD = 0.72
 DEFAULT_JUMP_DB = 4.0
 DEFAULT_MIN_DBFS = -40.0
 DEFAULT_RISE_DB = 3.5
-DEFAULT_POST_HIT_RISE_DB = 5.0
-DEFAULT_MIN_GAP_MS = 50.0
-DEFAULT_BLOCK_MS = 8.0
+DEFAULT_POST_HIT_RISE_DB = 1.5
+DEFAULT_MIN_GAP_MS = 35.0
+DEFAULT_BLOCK_MS = 4.0
 DEFAULT_DISPLAY_DBFS = 0.0
 LIVE_ALIGNMENT_SECONDS = 0.025
 LIVE_WARMUP_SECONDS = 0.50
 POST_HIT_WINDOW_SECONDS = 0.20
+OVERLAP_REARM_SECONDS = 1.50
+OVERLAP_IDENTITY_DROP = 0.17
+OVERLAP_ATTACK_DROP = 0.09
+OVERLAP_ONSET_FLOOR = 0.30
 ATTACK_FRAME_SECONDS = 0.012
 ATTACK_HOP_SECONDS = 0.004
 ATTACK_BACKTRACK_SECONDS = 0.028
@@ -54,7 +58,11 @@ FEATURE_FRAME_SECONDS = 0.020
 FEATURE_HOP_SECONDS = 0.005
 FEATURE_TIME_POINTS = 24
 FEATURE_BAND_COUNT = 24
-PROFILE_VERSION = 4
+OVERLAP_ATTACK_SECONDS = 0.075
+MIN_OVERLAP_IDENTITY_THRESHOLD = 0.55
+MIN_OVERLAP_ATTACK_THRESHOLD = 0.63
+MAX_OVERLAP_ENVELOPE_DISTANCE = 0.045
+PROFILE_VERSION = 5
 
 
 def dbfs(rms: float) -> float:
@@ -128,7 +136,7 @@ def frame_rms(audio: np.ndarray, frame_samples: int, hop_samples: int) -> np.nda
 
 
 def onset_strength(audio: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Measure sudden broadband changes, emphasizing a new cymbal attack."""
+    """Measure energy unexplained by the recent per-band decay trajectory."""
 
     frame_samples = max(16, round(sample_rate * ATTACK_FRAME_SECONDS))
     hop_samples = max(1, round(sample_rate * ATTACK_HOP_SECONDS))
@@ -140,17 +148,29 @@ def onset_strength(audio: np.ndarray, sample_rate: int) -> np.ndarray:
         audio = np.pad(audio, (0, required - len(audio)))
     indices = starts[:, None] + np.arange(frame_samples, dtype=np.int64)[None, :]
     frames = audio[indices] * np.hanning(frame_samples).astype(np.float32)[None, :]
-    spectrum = np.abs(np.fft.rfft(frames, axis=1))
+    spectrum = np.abs(np.fft.rfft(frames, axis=1)) ** 2 + 1e-12
     frequencies = np.fft.rfftfreq(frame_samples, d=1.0 / sample_rate)
-    band = (frequencies >= 900.0) & (frequencies <= min(8_000.0, sample_rate / 2.0))
-    spectrum = spectrum[:, band]
-    spectrum /= np.maximum(np.sum(spectrum, axis=1, keepdims=True), 1e-8)
-    flux = np.sum(np.maximum(spectrum[1:] - spectrum[:-1], 0.0), axis=1)
-    flux = np.concatenate([[0.0], flux])
-    levels = np.array([dbfs(value) for value in frame_rms(audio, frame_samples, hop_samples)])
-    energy_rise = np.maximum(levels - np.roll(levels, 1), 0.0)
-    energy_rise[0] = 0.0
-    return (flux + 0.06 * energy_rise).astype(np.float32)
+    log_bands = 10.0 * _log_band_energies(spectrum, frequencies)
+    scores = np.zeros(len(log_bands), dtype=np.float32)
+    for index in range(1, len(log_bands)):
+        history = log_bands[max(0, index - 20) : index]
+        recent = np.median(history[-min(3, len(history)) :], axis=0)
+        if len(history) >= 4:
+            slopes = np.diff(history[-min(8, len(history)) :], axis=0)
+            slope = np.clip(np.median(slopes, axis=0), -1.5, 0.25)
+        else:
+            slope = np.zeros(log_bands.shape[1], dtype=np.float32)
+        predicted = recent + slope
+        rises = np.maximum(log_bands[index] - predicted - 0.75, 0.0)
+        strongest = np.sort(rises)[-max(4, len(rises) // 3) :]
+        broadband = float(np.mean(rises >= 1.5))
+        residual = float(np.mean(strongest)) / 8.0
+
+        previous_shape = history[-1] - np.max(history[-1])
+        current_shape = log_bands[index] - np.max(log_bands[index])
+        shape_change = float(np.mean(np.maximum(current_shape - previous_shape, 0.0))) / 8.0
+        scores[index] = residual * (0.35 + 0.65 * broadband) + 0.20 * shape_change
+    return scores
 
 
 def _onset_threshold(strength: np.ndarray) -> float:
@@ -160,7 +180,7 @@ def _onset_threshold(strength: np.ndarray) -> float:
         return 0.0
     median = float(np.median(strength))
     deviation = float(np.median(np.abs(strength - median)))
-    return max(median * 1.8, median + 3.0 * deviation, 0.015)
+    return max(median * 2.2, median + 4.0 * deviation, 0.08)
 
 
 def _attack_start_frame(strength: np.ndarray, peak_frame: int) -> int:
@@ -206,6 +226,38 @@ def extract_attack(
     return segment[:clip_samples].astype(np.float32, copy=False), onset_sample
 
 
+def extract_attack_near(
+    audio: np.ndarray,
+    sample_rate: int,
+    clip_seconds: float,
+    pre_seconds: float,
+    expected_sample: int,
+) -> tuple[np.ndarray, int]:
+    """Align one candidate without jumping to another nearby strike."""
+
+    strength = onset_strength(audio, sample_rate)
+    hop_samples = max(1, round(sample_rate * ATTACK_HOP_SECONDS))
+    frame_offset = round(sample_rate * ATTACK_FRAME_SECONDS / 2.0)
+    expected_frame = round((expected_sample - frame_offset) / hop_samples)
+    radius = max(1, round(LIVE_ALIGNMENT_SECONDS / ATTACK_HOP_SECONDS))
+    search_start = max(0, expected_frame - radius)
+    search_end = min(len(strength), expected_frame + radius + 1)
+    local = strength[search_start:search_end]
+    if len(local):
+        local_peak = int(np.argmax(local))
+        onset_frame = search_start + _attack_start_frame(local, local_peak)
+    else:
+        onset_frame = max(0, expected_frame)
+    onset_sample = onset_frame * hop_samples + frame_offset
+
+    clip_samples = max(1, round(sample_rate * clip_seconds))
+    start = onset_sample - round(sample_rate * pre_seconds)
+    end = start + clip_samples
+    segment = audio[max(0, start) : min(len(audio), end)]
+    segment = np.pad(segment, (max(0, -start), max(0, end - len(audio))))
+    return segment[:clip_samples].astype(np.float32, copy=False), onset_sample
+
+
 def _log_band_energies(power: np.ndarray, frequencies: np.ndarray) -> np.ndarray:
     """Return log energy in frequency bands for every analysis frame."""
 
@@ -235,7 +287,11 @@ def _resample_features(values: np.ndarray, points: int = FEATURE_TIME_POINTS) ->
     ).astype(np.float32)
 
 
-def feature_vector(segment: np.ndarray, sample_rate: int) -> np.ndarray:
+def feature_vector(
+    segment: np.ndarray,
+    sample_rate: int,
+    pre_seconds: float = DEFAULT_PRE_SECONDS,
+) -> np.ndarray:
     """Create a volume-normalized attack-and-early-decay fingerprint.
 
     A generic impact and a cymbal can have similar first milliseconds. The
@@ -264,6 +320,30 @@ def feature_vector(segment: np.ndarray, sample_rate: int) -> np.ndarray:
     window = np.hanning(frame_samples).astype(np.float32)
     spectra = np.abs(np.fft.rfft(frames * window[None, :], axis=1)) ** 2 + 1e-12
     frequencies = np.fft.rfftfreq(frame_samples, d=1.0 / sample_rate)
+    onset_sample = round(sample_rate * pre_seconds)
+    pre_indices = np.flatnonzero(starts + frame_samples <= onset_sample)
+    post_indices = np.flatnonzero(starts >= onset_sample)
+    if not len(post_indices):
+        post_indices = np.array([len(starts) - 1])
+
+    if len(pre_indices):
+        pre_power = spectra[pre_indices]
+        baseline_power = np.median(pre_power[-min(3, len(pre_power)) :], axis=0)
+        if len(pre_power) >= 4:
+            log_history = np.log10(np.maximum(pre_power[-min(8, len(pre_power)) :], 1e-12))
+            decay_per_frame = np.clip(np.median(np.diff(log_history, axis=0), axis=0), -0.15, 0.025)
+        else:
+            decay_per_frame = np.zeros(spectra.shape[1], dtype=np.float32)
+    else:
+        baseline_power = np.full(spectra.shape[1], 1e-12, dtype=np.float32)
+        decay_per_frame = np.zeros(spectra.shape[1], dtype=np.float32)
+
+    baseline_log = np.log10(np.maximum(baseline_power, 1e-12))
+    residual_spectra = []
+    for offset, frame_index in enumerate(post_indices, start=1):
+        predicted_tail = np.power(10.0, baseline_log + decay_per_frame * offset)
+        residual_spectra.append(np.maximum(spectra[frame_index] - predicted_tail, 1e-12))
+    spectra = np.stack(residual_spectra, axis=0)
     log_bands = _log_band_energies(spectra, frequencies)
 
     # Global-relative energy retains the crucial fact that cymbal high bands
@@ -276,8 +356,8 @@ def feature_vector(segment: np.ndarray, sample_rate: int) -> np.ndarray:
         0.0,
     )
 
-    rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
-    envelope = np.log10(np.maximum(rms, 1e-6))
+    residual_rms = np.sqrt(np.sum(spectra, axis=1) + 1e-12)
+    envelope = np.log10(np.maximum(residual_rms, 1e-6))
     envelope -= np.max(envelope)
     envelope = np.clip(envelope, -6.0, 0.0) / 6.0
 
@@ -308,12 +388,23 @@ def feature_vector(segment: np.ndarray, sample_rate: int) -> np.ndarray:
     return result.astype(np.float32)
 
 
+def attack_feature_vector(segment: np.ndarray, sample_rate: int, pre_seconds: float) -> np.ndarray:
+    """Fingerprint only the residual attack used to verify overlapping hits."""
+
+    short_samples = round(sample_rate * (pre_seconds + OVERLAP_ATTACK_SECONDS))
+    short_segment = np.asarray(segment[:short_samples], dtype=np.float32)
+    if len(short_segment) < short_samples:
+        short_segment = np.pad(short_segment, (0, short_samples - len(short_segment)))
+    return feature_vector(short_segment, sample_rate, pre_seconds)
+
+
 @dataclass
 class Profile:
     sample_rate: int
     clip_seconds: float
     pre_seconds: float
     templates: np.ndarray
+    attack_templates: np.ndarray
     mean: np.ndarray
     std: np.ndarray
     negative_templates: np.ndarray
@@ -325,6 +416,7 @@ class Profile:
             "clip_seconds": self.clip_seconds,
             "pre_seconds": self.pre_seconds,
             "templates": self.templates.tolist(),
+            "attack_templates": self.attack_templates.tolist(),
             "mean": self.mean.tolist(),
             "std": self.std.tolist(),
             "negative_templates": self.negative_templates.tolist(),
@@ -337,6 +429,7 @@ class Profile:
                 "Profile was made by an older detector version; re-enroll the audio examples"
             )
         templates = np.asarray(data["templates"], dtype=np.float32)
+        attack_templates = np.asarray(data["attack_templates"], dtype=np.float32)
         mean = np.asarray(data["mean"], dtype=np.float32)
         std = np.asarray(data["std"], dtype=np.float32)
         negative_data = data.get("negative_templates", [])
@@ -347,6 +440,8 @@ class Profile:
         )
         if templates.ndim != 2 or templates.shape[0] == 0 or mean.ndim != 1 or std.ndim != 1:
             raise ValueError("Profile feature arrays have invalid shapes")
+        if attack_templates.ndim != 2 or attack_templates.shape != templates.shape:
+            raise ValueError("Profile attack-template dimensions do not match")
         if templates.shape[1] != len(mean) or len(mean) != len(std):
             raise ValueError("Profile feature dimensions do not match")
         if negative_templates.ndim != 2 or negative_templates.shape[1] != len(mean):
@@ -356,6 +451,7 @@ class Profile:
             clip_seconds=float(data["clip_seconds"]),
             pre_seconds=float(data["pre_seconds"]),
             templates=templates,
+            attack_templates=attack_templates,
             mean=mean,
             std=std,
             negative_templates=negative_templates,
@@ -391,10 +487,17 @@ def enroll(
             "--clip-seconds must be at least 0.16 so the detector can distinguish "
             "a cymbal's early decay from a generic impact"
         )
-    if pre_seconds < 0.0 or pre_seconds >= clip_seconds:
-        raise RuntimeError("--pre-seconds must be non-negative and shorter than --clip-seconds")
+    if pre_seconds < 0.04:
+        raise RuntimeError(
+            "--pre-seconds must be at least 0.04 so existing resonance can be estimated"
+        )
+    if clip_seconds - pre_seconds < 0.12:
+        raise RuntimeError(
+            "--clip-seconds must leave at least 0.12 seconds after the attack"
+        )
 
     templates = []
+    attack_templates = []
     tail_templates = []
     paths = list(files)
     if not paths:
@@ -403,26 +506,31 @@ def enroll(
     for path in paths:
         audio = load_audio(path, sample_rate)
         segment, peak_sample = extract_attack(audio, sample_rate, clip_seconds, pre_seconds)
-        templates.append(feature_vector(segment, sample_rate))
-        tail_start = peak_sample + round(sample_rate * ATTACK_TAIL_SECONDS)
+        templates.append(feature_vector(segment, sample_rate, pre_seconds))
+        attack_templates.append(attack_feature_vector(segment, sample_rate, pre_seconds))
+        tail_event = peak_sample + round(sample_rate * ATTACK_TAIL_SECONDS)
+        tail_start = tail_event - round(sample_rate * pre_seconds)
         tail_end = tail_start + round(sample_rate * clip_seconds)
         tail = audio[max(0, tail_start) : min(len(audio), tail_end)]
         tail = np.pad(tail, (max(0, -tail_start), max(0, tail_end - len(audio))))
         if len(tail):
-            tail_templates.append(feature_vector(tail[: round(sample_rate * clip_seconds)], sample_rate))
+            tail_templates.append(
+                feature_vector(tail[: round(sample_rate * clip_seconds)], sample_rate, pre_seconds)
+            )
         print(
             f"Enrolled {path} (attack at {peak_sample / sample_rate:.3f}s, "
             f"level {dbfs(float(np.sqrt(np.mean(segment * segment)))):.1f} dBFS)"
         )
 
     matrix = np.vstack(templates).astype(np.float32)
+    attack_matrix = np.vstack(attack_templates).astype(np.float32)
     mean = np.mean(matrix, axis=0).astype(np.float32)
     std = np.std(matrix, axis=0).astype(np.float32)
     negative_templates = list(tail_templates)
     for path in negative_files:
         audio = load_audio(path, sample_rate)
         segment, peak_sample = extract_attack(audio, sample_rate, clip_seconds, pre_seconds)
-        negative_templates.append(feature_vector(segment, sample_rate))
+        negative_templates.append(feature_vector(segment, sample_rate, pre_seconds))
         print(
             f"Enrolled rejection example {path} (attack at "
             f"{peak_sample / sample_rate:.3f}s)"
@@ -432,7 +540,16 @@ def enroll(
         if negative_templates
         else np.empty((0, matrix.shape[1]), dtype=np.float32)
     )
-    profile = Profile(sample_rate, clip_seconds, pre_seconds, matrix, mean, std, negative_matrix)
+    profile = Profile(
+        sample_rate,
+        clip_seconds,
+        pre_seconds,
+        matrix,
+        attack_matrix,
+        mean,
+        std,
+        negative_matrix,
+    )
     save_profile(profile, profile_path)
     negative_note = f" and {len(negative_templates)} rejection example(s)" if negative_templates else ""
     print(f"Saved profile with {len(paths)} example(s){negative_note} to {profile_path}")
@@ -443,12 +560,17 @@ def enroll(
         )
 
 
-def add_positive_template(profile: Profile, template: np.ndarray) -> None:
+def add_positive_template(
+    profile: Profile,
+    template: np.ndarray,
+    attack_template: np.ndarray,
+) -> None:
     """Append a positive example and refresh the stored profile statistics."""
 
     matrix = np.vstack([profile.templates, template]).astype(np.float32)
     mean = np.mean(matrix, axis=0).astype(np.float32)
     profile.templates = matrix
+    profile.attack_templates = np.vstack([profile.attack_templates, attack_template]).astype(np.float32)
     profile.mean = mean
     profile.std = np.std(matrix, axis=0).astype(np.float32)
 
@@ -480,7 +602,14 @@ def extract_background_templates(audio: np.ndarray, profile: Profile, max_exampl
     levels = np.array([float(np.sqrt(np.mean(segment * segment) + 1e-12)) for segment in segments])
     selected = np.argsort(levels)[-min(max_examples, len(segments)) :]
     return np.vstack(
-        [feature_vector(np.asarray(segments[index], dtype=np.float32), profile.sample_rate) for index in selected]
+        [
+            feature_vector(
+                np.asarray(segments[index], dtype=np.float32),
+                profile.sample_rate,
+                profile.pre_seconds,
+            )
+            for index in selected
+        ]
     ).astype(np.float32)
 
 
@@ -550,7 +679,11 @@ def calibrate_microphone(
                 profile.clip_seconds,
                 profile.pre_seconds,
             )
-            add_positive_template(profile, feature_vector(segment, profile.sample_rate))
+            add_positive_template(
+                profile,
+                feature_vector(segment, profile.sample_rate, profile.pre_seconds),
+                attack_feature_vector(segment, profile.sample_rate, profile.pre_seconds),
+            )
             save_profile(profile, profile_path)
             added += 1
             print(
@@ -655,25 +788,31 @@ def template_similarity(first: np.ndarray, second: np.ndarray) -> float:
     return float(np.clip(min(weighted, min(group_scores) + 0.20), 0.0, 1.0))
 
 
-def classify(segment: np.ndarray, profile: Profile) -> float:
-    """Return a 0..1 similarity score against an enrollment profile.
-
-    The positive score compares independent cymbal characteristics and, once
-    enough examples exist, requires support from more than one enrolled hit.
-    Rejection examples can reduce this score but can never increase it.
-    """
-
-    vector = feature_vector(segment, profile.sample_rate)
+def _positive_score(vector: np.ndarray, templates: np.ndarray) -> tuple[float, float]:
     comparisons = [
         (template_similarity(vector, template), feature_distance(vector, template))
-        for template in profile.templates
+        for template in templates
     ]
     comparisons.sort(key=lambda result: result[0], reverse=True)
-    positive_score, positive_distance = comparisons[0]
-    if len(comparisons) >= 3:
-        # Do not let one accidental match or one bad calibration sample define
-        # the class. A real target should resemble more than one positive hit.
-        positive_score = 0.75 * positive_score + 0.25 * comparisons[1][0]
+    score, distance = comparisons[0]
+    return float(score), float(distance)
+
+
+def classify_scores(segment: np.ndarray, profile: Profile) -> tuple[float, float, float]:
+    """Return identity, attack, and overlap-envelope comparison results.
+
+    The positive score compares independent cymbal characteristics against the
+    closest enrolled variation. Rejection examples can reduce this score but
+    can never increase it.
+    """
+
+    vector = feature_vector(segment, profile.sample_rate, profile.pre_seconds)
+    attack_vector = attack_feature_vector(segment, profile.sample_rate, profile.pre_seconds)
+    positive_score, positive_distance = _positive_score(vector, profile.templates)
+    attack_score, _ = _positive_score(attack_vector, profile.attack_templates)
+    envelope_distance = min(
+        feature_group_distances(vector, template)[2] for template in profile.templates
+    )
     if len(profile.negative_templates):
         negative_distance = min(feature_distance(vector, template) for template in profile.negative_templates)
         margin = negative_distance - positive_distance
@@ -681,8 +820,18 @@ def classify(segment: np.ndarray, profile: Profile) -> float:
         # Rejection data may only reduce confidence. Previously it could boost
         # a mediocre positive score, causing generic loud impacts to pass.
         rejection_ceiling = 0.50 + 0.50 * contrast_score
-        return float(np.clip(min(positive_score, rejection_ceiling), 0.0, 1.0))
-    return float(np.clip(positive_score, 0.0, 1.0))
+        positive_score = min(positive_score, rejection_ceiling)
+    return (
+        float(np.clip(positive_score, 0.0, 1.0)),
+        float(np.clip(attack_score, 0.0, 1.0)),
+        float(envelope_distance),
+    )
+
+
+def classify(segment: np.ndarray, profile: Profile) -> float:
+    """Return the full 0..1 identity score for compatibility."""
+
+    return classify_scores(segment, profile)[0]
 
 
 def format_time(seconds: float) -> str:
@@ -717,6 +866,7 @@ def detect_file(
     noise_floor = float(np.percentile(levels, 20))
     min_gap_samples = round(profile.sample_rate * min_gap_ms / 1000.0)
     last_hit = -min_gap_samples
+    last_detection = -round(profile.sample_rate * OVERLAP_REARM_SECONDS)
     pre_samples = round(profile.sample_rate * profile.pre_seconds)
     clip_samples = round(profile.sample_rate * profile.clip_seconds)
     detections = 0
@@ -737,11 +887,14 @@ def detect_file(
         )
         required_rise = max(rise_db, post_hit_rise_db) if within_post_hit_window else rise_db
         fresh_attack = measured_rise >= required_rise
+        overlap_mode = last_hit >= 0 and sample - last_hit < round(
+            profile.sample_rate * OVERLAP_REARM_SECONDS
+        )
         local_end = min(len(strengths), onset_number + 4)
         is_local_peak = strength >= float(np.max(strengths[onset_number:local_end]))
         if (
             strength < onset_threshold
-            or not fresh_attack
+            or (not fresh_attack and not overlap_mode)
             or not is_local_peak
             or level < min_dbfs
             or level < noise_floor + jump_db
@@ -755,18 +908,35 @@ def detect_file(
         segment = audio[max(0, start) : min(len(audio), end)]
         segment = np.pad(segment, (max(0, -start), max(0, end - len(audio))))
         segment = segment[:clip_samples]
-        score = classify(segment, profile)
+        score, attack_score, envelope_distance = classify_scores(segment, profile)
         last_hit = max(sample, event_sample)
-        if score >= threshold:
+        follows_detection = (
+            event_sample > last_detection
+            and event_sample - last_detection
+            < round(profile.sample_rate * OVERLAP_REARM_SECONDS)
+        )
+        required_threshold = threshold
+        required_attack = 0.0
+        if follows_detection:
+            required_threshold = max(MIN_OVERLAP_IDENTITY_THRESHOLD, threshold - OVERLAP_IDENTITY_DROP)
+            required_attack = max(MIN_OVERLAP_ATTACK_THRESHOLD, threshold - OVERLAP_ATTACK_DROP)
+        envelope_matches = not follows_detection or (
+            envelope_distance <= MAX_OVERLAP_ENVELOPE_DISTANCE
+        )
+        if score >= required_threshold and attack_score >= required_attack and envelope_matches:
             detections += 1
+            last_detection = event_sample
             print(
                 f"[{format_time(event_sample / profile.sample_rate)}] DETECTED "
-                f"score={score:.2f} level={level:.1f} dBFS"
+                f"score={score:.2f} attack={attack_score:.2f} "
+                f"envelope={envelope_distance:.3f} level={level:.1f} dBFS"
             )
         elif verbose:
             print(
                 f"[{format_time(event_sample / profile.sample_rate)}] "
-                f"loud candidate rejected score={score:.2f}"
+                f"loud candidate rejected score={score:.2f}/{required_threshold:.2f} "
+                f"attack={attack_score:.2f}/{required_attack:.2f} "
+                f"envelope={envelope_distance:.3f}/{MAX_OVERLAP_ENVELOPE_DISTANCE:.3f}"
             )
 
     if detections == 0:
@@ -820,6 +990,7 @@ class LiveDetector:
         self.post_hit_window_samples = round(profile.sample_rate * POST_HIT_WINDOW_SECONDS)
         self.warmup_samples = round(profile.sample_rate * LIVE_WARMUP_SECONDS)
         self.last_trigger_sample = -self.min_gap_samples
+        self.last_detection_sample = -round(profile.sample_rate * OVERLAP_REARM_SECONDS)
         self.recent_detection_peaks: deque[int] = deque()
         self.recent_levels: deque[tuple[int, float]] = deque()
         self.noise_levels: deque[tuple[int, float]] = deque()
@@ -853,17 +1024,42 @@ class LiveDetector:
             candidate.audio = np.concatenate([candidate.audio, block])
             if len(candidate.audio) >= self.context_samples:
                 context = candidate.audio[: self.context_samples]
-                segment, peak_in_context = extract_attack(
+                expected_in_context = candidate.trigger_sample - candidate.context_start_sample
+                segment, peak_in_context = extract_attack_near(
                     context,
                     self.profile.sample_rate,
                     self.profile.clip_seconds,
                     self.profile.pre_seconds,
+                    expected_in_context,
                 )
                 event_sample = candidate.context_start_sample + peak_in_context
                 event_seconds = event_sample / self.profile.sample_rate
-                score = classify(segment, self.profile)
-                if score >= self.threshold:
-                    duplicate_window = round(self.profile.sample_rate * 0.040)
+                score, attack_score, envelope_distance = classify_scores(segment, self.profile)
+                follows_detection = (
+                    event_sample > self.last_detection_sample
+                    and event_sample - self.last_detection_sample
+                    < round(self.profile.sample_rate * OVERLAP_REARM_SECONDS)
+                )
+                required_threshold = self.threshold
+                required_attack = 0.0
+                if follows_detection:
+                    required_threshold = max(
+                        MIN_OVERLAP_IDENTITY_THRESHOLD,
+                        self.threshold - OVERLAP_IDENTITY_DROP,
+                    )
+                    required_attack = max(
+                        MIN_OVERLAP_ATTACK_THRESHOLD,
+                        self.threshold - OVERLAP_ATTACK_DROP,
+                    )
+                envelope_matches = not follows_detection or (
+                    envelope_distance <= MAX_OVERLAP_ENVELOPE_DISTANCE
+                )
+                if (
+                    score >= required_threshold
+                    and attack_score >= required_attack
+                    and envelope_matches
+                ):
+                    duplicate_window = round(self.profile.sample_rate * 0.045)
                     duplicate = any(
                         abs(event_sample - previous_peak) <= duplicate_window
                         for previous_peak in self.recent_detection_peaks
@@ -872,13 +1068,16 @@ class LiveDetector:
                         if self.verbose:
                             print(
                                 f"[{format_time(event_seconds)}] duplicate candidate suppressed "
-                                f"score={score:.2f}",
+                                f"score={score:.2f} attack={attack_score:.2f}",
                                 flush=True,
                             )
                     else:
                         self.recent_detection_peaks.append(event_sample)
+                        self.last_detection_sample = event_sample
                         print(
                             f"[{format_time(event_seconds)}] DETECTED score={score:.2f} "
+                            f"attack={attack_score:.2f} "
+                            f"envelope={envelope_distance:.3f} "
                             f"level={candidate.level_db:.1f} dBFS "
                             f"floor={candidate.noise_floor_db:.1f} rise={candidate.rise_db:.1f} dB",
                             flush=True,
@@ -886,6 +1085,9 @@ class LiveDetector:
                 elif self.verbose:
                     print(
                         f"[{format_time(event_seconds)}] candidate rejected score={score:.2f} "
+                        f"required={required_threshold:.2f} "
+                        f"attack={attack_score:.2f}/{required_attack:.2f} "
+                        f"envelope={envelope_distance:.3f}/{MAX_OVERLAP_ENVELOPE_DISTANCE:.3f} "
                         f"level={candidate.level_db:.1f} dBFS "
                         f"floor={candidate.noise_floor_db:.1f} rise={candidate.rise_db:.1f} dB",
                         flush=True,
@@ -909,19 +1111,25 @@ class LiveDetector:
             else self.rise_db
         )
         fresh_attack = measured_rise >= required_rise
+        overlap_mode = self.last_trigger_sample >= 0 and trigger_sample - self.last_trigger_sample < round(
+            self.profile.sample_rate * OVERLAP_REARM_SECONDS
+        )
         cooldown_over = trigger_sample - self.last_trigger_sample >= self.min_gap_samples
         warmup_complete = self.total_samples >= self.warmup_samples
         recent_audio = self._ring_tail(min(len(self.ring), self.context_pre_samples + len(block)))
         recent_strength = onset_strength(recent_audio, self.profile.sample_rate)
+        evidence_threshold = _onset_threshold(recent_strength)
+        if overlap_mode:
+            evidence_threshold = min(evidence_threshold, OVERLAP_ONSET_FLOOR)
         attack_evidence = bool(
             len(recent_strength)
-            and np.max(recent_strength[-3:]) >= _onset_threshold(recent_strength)
+            and np.max(recent_strength[-3:]) >= evidence_threshold
         )
         if (
             warmup_complete
             and enough_volume
             and above_noise
-            and fresh_attack
+            and (fresh_attack or overlap_mode)
             and attack_evidence
             and cooldown_over
         ):
