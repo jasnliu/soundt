@@ -33,9 +33,9 @@ import numpy as np
 
 
 DEFAULT_SAMPLE_RATE = 16_000
-DEFAULT_CLIP_SECONDS = 0.07
+DEFAULT_CLIP_SECONDS = 0.24
 DEFAULT_PRE_SECONDS = 0.008
-DEFAULT_THRESHOLD = 0.60
+DEFAULT_THRESHOLD = 0.72
 DEFAULT_JUMP_DB = 4.0
 DEFAULT_MIN_DBFS = -40.0
 DEFAULT_RISE_DB = 3.5
@@ -48,9 +48,13 @@ LIVE_WARMUP_SECONDS = 0.50
 POST_HIT_WINDOW_SECONDS = 0.20
 ATTACK_FRAME_SECONDS = 0.012
 ATTACK_HOP_SECONDS = 0.004
-ATTACK_SEARCH_SECONDS = 0.18
-ATTACK_TAIL_SECONDS = 0.10
-PROFILE_VERSION = 3
+ATTACK_BACKTRACK_SECONDS = 0.028
+ATTACK_TAIL_SECONDS = 0.28
+FEATURE_FRAME_SECONDS = 0.020
+FEATURE_HOP_SECONDS = 0.005
+FEATURE_TIME_POINTS = 24
+FEATURE_BAND_COUNT = 24
+PROFILE_VERSION = 4
 
 
 def dbfs(rms: float) -> float:
@@ -159,24 +163,34 @@ def _onset_threshold(strength: np.ndarray) -> float:
     return max(median * 1.8, median + 3.0 * deviation, 0.015)
 
 
+def _attack_start_frame(strength: np.ndarray, peak_frame: int) -> int:
+    """Backtrack from an onset peak to the beginning of its attack cluster."""
+
+    if not len(strength):
+        return 0
+    peak_frame = int(np.clip(peak_frame, 0, len(strength) - 1))
+    peak_strength = float(strength[peak_frame])
+    backtrack_frames = max(1, round(ATTACK_BACKTRACK_SECONDS / ATTACK_HOP_SECONDS))
+    search_start = max(0, peak_frame - backtrack_frames)
+    threshold = max(_onset_threshold(strength), 0.18 * peak_strength)
+    candidates = np.flatnonzero(strength[search_start : peak_frame + 1] >= threshold)
+    return search_start + int(candidates[0]) if len(candidates) else peak_frame
+
+
 def extract_attack(
     audio: np.ndarray,
     sample_rate: int,
     clip_seconds: float,
     pre_seconds: float,
 ) -> tuple[np.ndarray, int]:
-    """Return a short clip aligned to the first strong attack, not the decay peak."""
+    """Return a clip aligned to the start of the recording's strongest attack."""
 
     strength = onset_strength(audio, sample_rate)
     hop_samples = max(1, round(sample_rate * ATTACK_HOP_SECONDS))
-    search_frames = max(1, round(ATTACK_SEARCH_SECONDS / ATTACK_HOP_SECONDS))
-    search = strength[: min(len(strength), search_frames)]
-    threshold = _onset_threshold(search)
-    candidates = np.flatnonzero(search >= threshold)
-    if len(candidates):
-        onset_frame = int(candidates[0])
-    else:
-        onset_frame = int(np.argmax(search)) if len(search) else 0
+    peak_frame = int(np.argmax(strength)) if len(strength) else 0
+    # Locate the beginning of the strongest onset cluster. This avoids treating
+    # a tiny click or room-noise fluctuation before the real hit as enrollment.
+    onset_frame = _attack_start_frame(strength, peak_frame)
     onset_sample = onset_frame * hop_samples + round(sample_rate * ATTACK_FRAME_SECONDS / 2.0)
 
     clip_samples = max(1, round(sample_rate * clip_seconds))
@@ -192,41 +206,12 @@ def extract_attack(
     return segment[:clip_samples].astype(np.float32, copy=False), onset_sample
 
 
-def extract_transient(
-    audio: np.ndarray,
-    sample_rate: int,
-    clip_seconds: float,
-    pre_seconds: float,
-) -> tuple[np.ndarray, int]:
-    """Return a fixed-size clip around the loudest transient in a file."""
+def _log_band_energies(power: np.ndarray, frequencies: np.ndarray) -> np.ndarray:
+    """Return log energy in frequency bands for every analysis frame."""
 
-    frame_samples = max(1, round(sample_rate * 0.025))
-    hop_samples = max(1, round(sample_rate * 0.010))
-    levels = frame_rms(audio, frame_samples, hop_samples)
-    peak_frame = int(np.argmax(levels))
-    peak_sample = peak_frame * hop_samples + frame_samples // 2
-
-    clip_samples = max(1, round(sample_rate * clip_seconds))
-    start = peak_sample - round(sample_rate * pre_seconds)
-    end = start + clip_samples
-    source_start = max(0, start)
-    source_end = min(len(audio), end)
-    segment = audio[source_start:source_end]
-    left_pad = max(0, -start)
-    right_pad = max(0, end - len(audio))
-    if left_pad or right_pad:
-        segment = np.pad(segment, (left_pad, right_pad))
-    if len(segment) < clip_samples:
-        segment = np.pad(segment, (0, clip_samples - len(segment)))
-    return segment[:clip_samples].astype(np.float32, copy=False), peak_sample
-
-
-def _log_band_shapes(power: np.ndarray, frequencies: np.ndarray) -> np.ndarray:
-    """Return a time-varying, relative spectrum in log-spaced bands."""
-
-    low = 60.0
+    low = 80.0
     high = min(8_000.0, float(frequencies[-1]))
-    edges = np.geomspace(low, max(low * 1.01, high), 25)
+    edges = np.geomspace(low, max(low * 1.01, high), FEATURE_BAND_COUNT + 1)
     energies = []
     for lower, upper in zip(edges[:-1], edges[1:]):
         band = power[:, (frequencies >= lower) & (frequencies < upper)]
@@ -234,21 +219,28 @@ def _log_band_shapes(power: np.ndarray, frequencies: np.ndarray) -> np.ndarray:
             energies.append(np.mean(band, axis=1))
         else:
             energies.append(np.full(power.shape[0], 1e-12, dtype=np.float32))
-    matrix = np.stack(energies, axis=1)
-    log_energies = np.log10(np.maximum(matrix, 1e-12))
-    relative = log_energies - np.max(log_energies, axis=1, keepdims=True)
-    # Preserve where the energy is concentrated while allowing modest changes
-    # in pitch and microphone response. Each frame is in roughly [-1, 0].
-    return np.clip(relative / 4.0, -1.0, 0.0).astype(np.float32)
+    return np.log10(np.maximum(np.stack(energies, axis=1), 1e-12)).astype(np.float32)
+
+
+def _resample_features(values: np.ndarray, points: int = FEATURE_TIME_POINTS) -> np.ndarray:
+    """Resample one- or two-dimensional frame features to a fixed time grid."""
+
+    old_axis = np.linspace(0.0, 1.0, len(values))
+    new_axis = np.linspace(0.0, 1.0, points)
+    if values.ndim == 1:
+        return np.interp(new_axis, old_axis, values).astype(np.float32)
+    return np.stack(
+        [np.interp(new_axis, old_axis, values[:, column]) for column in range(values.shape[1])],
+        axis=1,
+    ).astype(np.float32)
 
 
 def feature_vector(segment: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Create a volume-normalized fingerprint for a short attack window.
+    """Create a volume-normalized attack-and-early-decay fingerprint.
 
-    The first part describes spectral shape. The second part describes the
-    short attack envelope. Both are normalized, so classification is
-    mostly independent of how hard the sound was played. Loudness is checked
-    separately by the detector.
+    A generic impact and a cymbal can have similar first milliseconds. The
+    fingerprint therefore preserves frequency-specific decay, spectral shape,
+    the overall envelope, and several timbre descriptors across the full clip.
     """
 
     x = np.asarray(segment, dtype=np.float32)
@@ -257,8 +249,8 @@ def feature_vector(segment: np.ndarray, sample_rate: int) -> np.ndarray:
     if peak > 1e-6:
         x = x / peak
 
-    frame_samples = max(16, round(sample_rate * 0.025))
-    hop_samples = max(1, round(sample_rate * 0.010))
+    frame_samples = max(16, round(sample_rate * FEATURE_FRAME_SECONDS))
+    hop_samples = max(1, round(sample_rate * FEATURE_HOP_SECONDS))
     if len(x) < frame_samples:
         x = np.pad(x, (0, frame_samples - len(x)))
     starts = np.arange(0, max(1, len(x) - frame_samples + 1), hop_samples)
@@ -270,30 +262,49 @@ def feature_vector(segment: np.ndarray, sample_rate: int) -> np.ndarray:
     indices = starts[:, None] + np.arange(frame_samples, dtype=np.int64)[None, :]
     frames = x[indices]
     window = np.hanning(frame_samples).astype(np.float32)
-    spectra = np.abs(np.fft.rfft(frames * window[None, :], axis=1)) ** 2
+    spectra = np.abs(np.fft.rfft(frames * window[None, :], axis=1)) ** 2 + 1e-12
     frequencies = np.fft.rfftfreq(frame_samples, d=1.0 / sample_rate)
-    spectral = _log_band_shapes(spectra, frequencies)
+    log_bands = _log_band_energies(spectra, frequencies)
+
+    # Global-relative energy retains the crucial fact that cymbal high bands
+    # continue after the initial spike. Per-frame shape separately captures
+    # timbre without depending on how hard the cymbal was struck.
+    joint_decay = np.clip((log_bands - np.max(log_bands)) / 6.0, -1.0, 0.0)
+    spectral_shape = np.clip(
+        (log_bands - np.max(log_bands, axis=1, keepdims=True)) / 4.0,
+        -1.0,
+        0.0,
+    )
 
     rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
     envelope = np.log10(np.maximum(rms, 1e-6))
     envelope -= np.max(envelope)
     envelope = np.clip(envelope, -6.0, 0.0) / 6.0
-    target_points = 16
-    old_axis = np.linspace(0.0, 1.0, len(spectral))
-    new_axis = np.linspace(0.0, 1.0, target_points)
-    spectral = np.stack(
-        [np.interp(new_axis, old_axis, spectral[:, band]) for band in range(spectral.shape[1])],
+
+    total_power = np.sum(spectra, axis=1)
+    nyquist = max(1.0, sample_rate / 2.0)
+    centroid = np.sum(spectra * frequencies[None, :], axis=1) / np.maximum(total_power, 1e-12)
+    high_frequency = np.sum(spectra[:, frequencies >= 2_500.0], axis=1) / np.maximum(
+        total_power, 1e-12
+    )
+    flatness = np.exp(np.mean(np.log(spectra), axis=1)) / np.maximum(
+        np.mean(spectra, axis=1), 1e-12
+    )
+    cumulative = np.cumsum(spectra, axis=1)
+    rolloff_indices = np.argmax(cumulative >= 0.85 * cumulative[:, -1, None], axis=1)
+    descriptors = np.stack(
+        [centroid / nyquist, high_frequency, flatness, frequencies[rolloff_indices] / nyquist],
         axis=1,
     )
-    if len(envelope) == 1:
-        envelope = np.repeat(envelope, target_points)
-    else:
-        envelope = np.interp(new_axis, np.linspace(0.0, 1.0, len(envelope)), envelope)
 
-    # Weight the short attack shape enough to matter alongside the time-varying
-    # spectrum. Do not L2-normalize: absolute feature distance is used for a
-    # stricter nearest-template comparison.
-    result = np.concatenate([spectral.ravel(), (3.0 * envelope).astype(np.float32)])
+    result = np.concatenate(
+        [
+            _resample_features(joint_decay).ravel(),
+            _resample_features(spectral_shape).ravel(),
+            _resample_features(envelope),
+            _resample_features(descriptors).ravel(),
+        ]
+    )
     return result.astype(np.float32)
 
 
@@ -373,6 +384,16 @@ def enroll(
 ) -> None:
     """Build a profile from positive and optional negative recordings."""
 
+    if sample_rate < 8_000:
+        raise RuntimeError("--sample-rate must be at least 8000 Hz")
+    if clip_seconds < 0.16:
+        raise RuntimeError(
+            "--clip-seconds must be at least 0.16 so the detector can distinguish "
+            "a cymbal's early decay from a generic impact"
+        )
+    if pre_seconds < 0.0 or pre_seconds >= clip_seconds:
+        raise RuntimeError("--pre-seconds must be non-negative and shorter than --clip-seconds")
+
     templates = []
     tail_templates = []
     paths = list(files)
@@ -396,9 +417,6 @@ def enroll(
 
     matrix = np.vstack(templates).astype(np.float32)
     mean = np.mean(matrix, axis=0).astype(np.float32)
-    mean_norm = float(np.linalg.norm(mean))
-    if mean_norm > 1e-8:
-        mean /= mean_norm
     std = np.std(matrix, axis=0).astype(np.float32)
     negative_templates = list(tail_templates)
     for path in negative_files:
@@ -418,6 +436,11 @@ def enroll(
     save_profile(profile, profile_path)
     negative_note = f" and {len(negative_templates)} rejection example(s)" if negative_templates else ""
     print(f"Saved profile with {len(paths)} example(s){negative_note} to {profile_path}")
+    if len(paths) < 3:
+        print(
+            "Note: enroll or microphone-calibrate at least 3-5 varied target hits "
+            "for reliable positive-only recognition."
+        )
 
 
 def add_positive_template(profile: Profile, template: np.ndarray) -> None:
@@ -425,9 +448,6 @@ def add_positive_template(profile: Profile, template: np.ndarray) -> None:
 
     matrix = np.vstack([profile.templates, template]).astype(np.float32)
     mean = np.mean(matrix, axis=0).astype(np.float32)
-    mean_norm = float(np.linalg.norm(mean))
-    if mean_norm > 1e-8:
-        mean /= mean_norm
     profile.templates = matrix
     profile.mean = mean
     profile.std = np.std(matrix, axis=0).astype(np.float32)
@@ -596,38 +616,72 @@ def calibrate_background(
         raise RuntimeError(f"Could not record background calibration: {exc}") from exc
 
 
-def cosine_similarity(first: np.ndarray, second: np.ndarray) -> float:
-    denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
-    if denominator <= 1e-8:
-        return 0.0
-    return float(np.dot(first, second) / denominator)
+def feature_group_distances(first: np.ndarray, second: np.ndarray) -> tuple[float, float, float, float]:
+    """Compare decay, spectral shape, envelope, and timbre independently."""
+
+    band_values = FEATURE_TIME_POINTS * FEATURE_BAND_COUNT
+    envelope_start = 2 * band_values
+    descriptor_start = envelope_start + FEATURE_TIME_POINTS
+    return (
+        float(np.mean(np.abs(first[:band_values] - second[:band_values]))),
+        float(np.mean(np.abs(first[band_values:envelope_start] - second[band_values:envelope_start]))),
+        float(
+            np.mean(
+                np.abs(
+                    first[envelope_start:descriptor_start]
+                    - second[envelope_start:descriptor_start]
+                )
+            )
+        ),
+        float(np.mean(np.abs(first[descriptor_start:] - second[descriptor_start:]))),
+    )
 
 
 def feature_distance(first: np.ndarray, second: np.ndarray) -> float:
-    """Mean absolute distance; unlike cosine, it has a meaningful zero."""
+    """Weighted identity distance used for positive and rejection margins."""
 
-    return float(np.mean(np.abs(first - second)))
+    distances = feature_group_distances(first, second)
+    return float(np.dot(distances, (0.45, 0.25, 0.15, 0.15)))
+
+
+def template_similarity(first: np.ndarray, second: np.ndarray) -> float:
+    """Require all cymbal-signature groups to resemble one enrolled hit."""
+
+    distances = feature_group_distances(first, second)
+    scales = (0.30, 0.26, 0.22, 0.24)
+    group_scores = [math.exp(-distance / scale) for distance, scale in zip(distances, scales)]
+    weighted = float(np.dot(group_scores, (0.45, 0.25, 0.15, 0.15)))
+    # A generic impulse must not pass on one matching characteristic alone.
+    return float(np.clip(min(weighted, min(group_scores) + 0.20), 0.0, 1.0))
 
 
 def classify(segment: np.ndarray, profile: Profile) -> float:
     """Return a 0..1 similarity score against an enrollment profile.
 
-    The positive score is based on the nearest enrolled example. If rejection
-    examples exist, the score is also required to be closer to the positive
-    class than to the rejection class.
+    The positive score compares independent cymbal characteristics and, once
+    enough examples exist, requires support from more than one enrolled hit.
+    Rejection examples can reduce this score but can never increase it.
     """
 
     vector = feature_vector(segment, profile.sample_rate)
-    positive_distance = min(feature_distance(vector, template) for template in profile.templates)
-    # A distance of zero is an exact fingerprint match. The scale is expressed
-    # in feature units and intentionally makes the no-negative-example mode
-    # conservative.
-    positive_score = math.exp(-positive_distance / 0.28)
+    comparisons = [
+        (template_similarity(vector, template), feature_distance(vector, template))
+        for template in profile.templates
+    ]
+    comparisons.sort(key=lambda result: result[0], reverse=True)
+    positive_score, positive_distance = comparisons[0]
+    if len(comparisons) >= 3:
+        # Do not let one accidental match or one bad calibration sample define
+        # the class. A real target should resemble more than one positive hit.
+        positive_score = 0.75 * positive_score + 0.25 * comparisons[1][0]
     if len(profile.negative_templates):
         negative_distance = min(feature_distance(vector, template) for template in profile.negative_templates)
         margin = negative_distance - positive_distance
-        contrast_score = 1.0 / (1.0 + math.exp(-margin / 0.035))
-        return float(np.clip(0.60 * positive_score + 0.40 * contrast_score, 0.0, 1.0))
+        contrast_score = 1.0 / (1.0 + math.exp(-margin / 0.040))
+        # Rejection data may only reduce confidence. Previously it could boost
+        # a mediocre positive score, causing generic loud impacts to pass.
+        rejection_ceiling = 0.50 + 0.50 * contrast_score
+        return float(np.clip(min(positive_score, rejection_ceiling), 0.0, 1.0))
     return float(np.clip(positive_score, 0.0, 1.0))
 
 
@@ -694,20 +748,26 @@ def detect_file(
         ):
             continue
 
-        start = sample - pre_samples
+        event_frame = _attack_start_frame(strengths, onset_number)
+        event_sample = event_frame * onset_hop + onset_frame // 2
+        start = event_sample - pre_samples
         end = start + clip_samples
-        source_start = max(0, start)
-        source_end = min(len(audio), end)
-        segment = audio[source_start:source_end]
+        segment = audio[max(0, start) : min(len(audio), end)]
         segment = np.pad(segment, (max(0, -start), max(0, end - len(audio))))
         segment = segment[:clip_samples]
         score = classify(segment, profile)
-        last_hit = sample
+        last_hit = max(sample, event_sample)
         if score >= threshold:
             detections += 1
-            print(f"[{format_time(sample / profile.sample_rate)}] DETECTED score={score:.2f} level={level:.1f} dBFS")
+            print(
+                f"[{format_time(event_sample / profile.sample_rate)}] DETECTED "
+                f"score={score:.2f} level={level:.1f} dBFS"
+            )
         elif verbose:
-            print(f"[{format_time(sample / profile.sample_rate)}] loud candidate rejected score={score:.2f}")
+            print(
+                f"[{format_time(event_sample / profile.sample_rate)}] "
+                f"loud candidate rejected score={score:.2f}"
+            )
 
     if detections == 0:
         print("No matching hits detected.")

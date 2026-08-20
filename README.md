@@ -1,15 +1,14 @@
 # User-trained rhythmic sound detector
 
-This is a small, local Python program for detecting a particular loud,
-short sound: a drum hit, hand clap, stick click, foot tap, or another rhythmic
-transient. It does not use a pretrained drum classifier. Instead, it learns a
-profile from recordings you provide.
+This is a small, local Python program for detecting a particular percussive
+sound, including a cymbal hit. It does not use a pretrained drum classifier.
+Instead, it learns a profile from recordings you provide.
 
 The detector uses two checks:
 
 1. The signal must contain a sudden broadband attack above the recent noise floor.
-2. That short attack must resemble the enrolled examples by spectral shape and
-   envelope.
+2. The attack and its first 240 ms must resemble the enrolled examples by
+   frequency-specific decay, spectral shape, envelope, and timbre.
 
 The detector is intentionally looking for the start of a hit. A cymbal's
 continuing resonance is not treated as a new hit: enrollment fingerprints are
@@ -32,22 +31,29 @@ brew install portaudio
 
 ## Enroll examples
 
-Record or copy one clean example per file. Slightly different recordings are
-recommended; they make the profile less brittle. Since loudness alone is not
-enough to identify a sound, also record a few loud sounds that should *not* be
-detected and pass them as rejection examples.
+Record or copy one clean example per file. Use at least 3-5 slightly different
+target hits; they make the positive-only profile less brittle. Negative
+examples are optional refinements, not a requirement to enumerate every sound
+that should be ignored.
 
 ```bash
-python sound_detector.py enroll examples/hit-1.wav examples/hit-2.wav examples/hit-3.wav \
-  --negative examples/clap.wav --negative examples/tap.wav \
+python sound_detector.py enroll \
+  examples/hit-1.wav examples/hit-2.wav examples/hit-3.wav \
   --profile hit.json
 ```
 
 Each file can contain silence around one hit. During enrollment the program
-finds the first strong broadband attack and saves only its short fingerprint
-in `hit.json`. A later portion of each example is also stored as a rejection
-example so the cymbal's resonance is not mistaken for another hit. The
-original recordings are not copied into the profile.
+finds the beginning of its strongest broadband attack and saves the attack plus
+early decay fingerprint in `hit.json`. A later portion of each example is also
+stored as a rejection example so the cymbal's resonance is not mistaken for
+another hit. The original recordings are not copied into the profile.
+
+Explicit negatives remain available when one particular sound is troublesome:
+
+```bash
+python sound_detector.py enroll examples/hit-1.wav examples/hit-2.wav \
+  --negative examples/clap.wav --profile hit.json
+```
 
 ## Calibrate with the actual microphone
 
@@ -88,13 +94,12 @@ The terminal prints updates such as:
 [00:02.41] DETECTED score=0.91 level=-12.7 dBFS
 ```
 
-The `--negative` examples are the most important protection against false
-positives. They should include the loud sounds that commonly happen in your
-real setup. Useful tuning options:
+The positive fingerprint is the main protection against false positives.
+Useful tuning options:
 
 ```bash
 python sound_detector.py detect recording.wav --profile hit.json \
-  --threshold 0.65 --jump-db 4 --min-dbfs -40 --verbose
+  --threshold 0.72 --jump-db 4 --min-dbfs -40 --verbose
 ```
 
 Raise `--threshold` to reject more borderline sounds; lower it only if valid
@@ -146,18 +151,14 @@ Then pass its numeric ID or name:
 python sound_detector.py listen --profile hit.json --device 2
 ```
 
-The listener keeps a short alignment buffer, waits about 90 ms after a candidate
-onset, then prints a detection after classifying the attack-aligned clip. The
+The listener keeps a short alignment buffer, waits roughly 250 ms after a
+candidate onset, then prints a detection after classifying the attack and early
+decay. The
 first half-second is used to measure the room and produces no detections. The
-default 4 dB loudness jump and 0.60 similarity threshold are starting points;
-rejection examples and a higher threshold are better than relying on volume
-alone. To trade some accuracy for a faster response, enroll with a shorter clip:
-
-```bash
-python sound_detector.py enroll hit.mp3 --clip-seconds 0.055 --pre-seconds 0.006 \
-  --profile hit-fast.json
-python sound_detector.py listen --profile hit-fast.json --block-ms 6
-```
+default 4 dB loudness jump and 0.72 similarity threshold are starting points.
+The identity fingerprint—not volume—is what should accept or reject a
+candidate. Clips shorter than 160 ms are refused because they discard the
+early decay that distinguishes a cymbal from an ordinary impact.
 
 The live detector can analyze overlapping hit windows, so it does not need to
 wait for one sound to finish before watching for the next attack. For very fast
@@ -172,15 +173,15 @@ python sound_detector.py listen --profile hit.json \
 `--rise-db` is the short-term increase that marks a new attack. Spectral flux is
 also required, which helps reject gradual cymbal resonance. Lower either
 value carefully if hits are missed; the fingerprint still decides whether each
-candidate is the enrolled sound. Use these softer settings only after recording
-background rejection examples.
+candidate is the enrolled sound.
 
 For 200 ms after a candidate hit, the detector applies a stricter 5 dB rise
 requirement. This rejects low-rise decay and reverb without blocking a genuinely
 sharp following hit. Change it with `--post-hit-rise-db` if necessary.
 
-Profiles created with older versions should be re-enrolled because the new
-profile is attack-aligned and includes resonance-tail rejection examples.
+Profiles created with older versions must be re-enrolled. Version 4 profiles
+use corrected attack alignment and retain early decay and timbre information;
+rejection data can only lower a candidate's score, never raise it.
 
 ## Limitations
 
