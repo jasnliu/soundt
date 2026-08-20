@@ -7,9 +7,14 @@ profile from recordings you provide.
 
 The detector uses two checks:
 
-1. The signal must be a large volume increase above the recent noise floor.
-2. The short sound must resemble the enrolled examples by spectral shape and
-   attack/decay envelope.
+1. The signal must contain a sudden broadband attack above the recent noise floor.
+2. That short attack must resemble the enrolled examples by spectral shape and
+   envelope.
+
+The detector is intentionally looking for the start of a hit. A cymbal's
+continuing resonance is not treated as a new hit: enrollment fingerprints are
+aligned to the first attack, and the resonance tail is automatically added as
+rejection data.
 
 ## Install
 
@@ -39,8 +44,10 @@ python sound_detector.py enroll examples/hit-1.wav examples/hit-2.wav examples/h
 ```
 
 Each file can contain silence around one hit. During enrollment the program
-finds the loudest transient and saves only its compact fingerprint in
-`hit.json`. The original recordings are not copied into the profile.
+finds the first strong broadband attack and saves only its short fingerprint
+in `hit.json`. A later portion of each example is also stored as a rejection
+example so the cymbal's resonance is not mistaken for another hit. The
+original recordings are not copied into the profile.
 
 ## Calibrate with the actual microphone
 
@@ -139,8 +146,8 @@ Then pass its numeric ID or name:
 python sound_detector.py listen --profile hit.json --device 2
 ```
 
-The listener keeps a short alignment buffer, waits about 90 ms after a loud
-onset, then prints a detection after classifying the complete short clip. The
+The listener keeps a short alignment buffer, waits about 90 ms after a candidate
+onset, then prints a detection after classifying the attack-aligned clip. The
 first half-second is used to measure the room and produces no detections. The
 default 4 dB loudness jump and 0.60 similarity threshold are starting points;
 rejection examples and a higher threshold are better than relying on volume
@@ -162,7 +169,8 @@ python sound_detector.py listen --profile hit.json \
 ```
 
 `--min-gap-ms` is the shortest allowed time between candidate hits.
-`--rise-db` is the short-term increase that marks a new attack. Lower either
+`--rise-db` is the short-term increase that marks a new attack. Spectral flux is
+also required, which helps reject gradual cymbal resonance. Lower either
 value carefully if hits are missed; the fingerprint still decides whether each
 candidate is the enrolled sound. Use these softer settings only after recording
 background rejection examples.
@@ -172,7 +180,7 @@ requirement. This rejects low-rise decay and reverb without blocking a genuinely
 sharp following hit. Change it with `--post-hit-rise-db` if necessary.
 
 Profiles created with older versions should be re-enrolled because the new
-profile preserves time-varying spectral detail.
+profile is attack-aligned and includes resonance-tail rejection examples.
 
 ## Limitations
 

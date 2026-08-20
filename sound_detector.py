@@ -46,7 +46,11 @@ DEFAULT_DISPLAY_DBFS = 0.0
 LIVE_ALIGNMENT_SECONDS = 0.025
 LIVE_WARMUP_SECONDS = 0.50
 POST_HIT_WINDOW_SECONDS = 0.20
-PROFILE_VERSION = 2
+ATTACK_FRAME_SECONDS = 0.012
+ATTACK_HOP_SECONDS = 0.004
+ATTACK_SEARCH_SECONDS = 0.18
+ATTACK_TAIL_SECONDS = 0.10
+PROFILE_VERSION = 3
 
 
 def dbfs(rms: float) -> float:
@@ -119,6 +123,75 @@ def frame_rms(audio: np.ndarray, frame_samples: int, hop_samples: int) -> np.nda
     return np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
 
 
+def onset_strength(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Measure sudden broadband changes, emphasizing a new cymbal attack."""
+
+    frame_samples = max(16, round(sample_rate * ATTACK_FRAME_SECONDS))
+    hop_samples = max(1, round(sample_rate * ATTACK_HOP_SECONDS))
+    if len(audio) < frame_samples:
+        audio = np.pad(audio, (0, frame_samples - len(audio)))
+    starts = np.arange(0, max(1, len(audio) - frame_samples + 1), hop_samples)
+    required = int(starts[-1] + frame_samples)
+    if required > len(audio):
+        audio = np.pad(audio, (0, required - len(audio)))
+    indices = starts[:, None] + np.arange(frame_samples, dtype=np.int64)[None, :]
+    frames = audio[indices] * np.hanning(frame_samples).astype(np.float32)[None, :]
+    spectrum = np.abs(np.fft.rfft(frames, axis=1))
+    frequencies = np.fft.rfftfreq(frame_samples, d=1.0 / sample_rate)
+    band = (frequencies >= 900.0) & (frequencies <= min(8_000.0, sample_rate / 2.0))
+    spectrum = spectrum[:, band]
+    spectrum /= np.maximum(np.sum(spectrum, axis=1, keepdims=True), 1e-8)
+    flux = np.sum(np.maximum(spectrum[1:] - spectrum[:-1], 0.0), axis=1)
+    flux = np.concatenate([[0.0], flux])
+    levels = np.array([dbfs(value) for value in frame_rms(audio, frame_samples, hop_samples)])
+    energy_rise = np.maximum(levels - np.roll(levels, 1), 0.0)
+    energy_rise[0] = 0.0
+    return (flux + 0.06 * energy_rise).astype(np.float32)
+
+
+def _onset_threshold(strength: np.ndarray) -> float:
+    """Return a robust threshold that ignores a recording's overall loudness."""
+
+    if not len(strength):
+        return 0.0
+    median = float(np.median(strength))
+    deviation = float(np.median(np.abs(strength - median)))
+    return max(median * 1.8, median + 3.0 * deviation, 0.015)
+
+
+def extract_attack(
+    audio: np.ndarray,
+    sample_rate: int,
+    clip_seconds: float,
+    pre_seconds: float,
+) -> tuple[np.ndarray, int]:
+    """Return a short clip aligned to the first strong attack, not the decay peak."""
+
+    strength = onset_strength(audio, sample_rate)
+    hop_samples = max(1, round(sample_rate * ATTACK_HOP_SECONDS))
+    search_frames = max(1, round(ATTACK_SEARCH_SECONDS / ATTACK_HOP_SECONDS))
+    search = strength[: min(len(strength), search_frames)]
+    threshold = _onset_threshold(search)
+    candidates = np.flatnonzero(search >= threshold)
+    if len(candidates):
+        onset_frame = int(candidates[0])
+    else:
+        onset_frame = int(np.argmax(search)) if len(search) else 0
+    onset_sample = onset_frame * hop_samples + round(sample_rate * ATTACK_FRAME_SECONDS / 2.0)
+
+    clip_samples = max(1, round(sample_rate * clip_seconds))
+    start = onset_sample - round(sample_rate * pre_seconds)
+    end = start + clip_samples
+    source_start = max(0, start)
+    source_end = min(len(audio), end)
+    segment = audio[source_start:source_end]
+    if start < 0 or end > len(audio):
+        segment = np.pad(segment, (max(0, -start), max(0, end - len(audio))))
+    if len(segment) < clip_samples:
+        segment = np.pad(segment, (0, clip_samples - len(segment)))
+    return segment[:clip_samples].astype(np.float32, copy=False), onset_sample
+
+
 def extract_transient(
     audio: np.ndarray,
     sample_rate: int,
@@ -170,10 +243,10 @@ def _log_band_shapes(power: np.ndarray, frequencies: np.ndarray) -> np.ndarray:
 
 
 def feature_vector(segment: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Create a volume-normalized fingerprint for one transient.
+    """Create a volume-normalized fingerprint for a short attack window.
 
     The first part describes spectral shape. The second part describes the
-    short attack/decay envelope. Both are normalized, so classification is
+    short attack envelope. Both are normalized, so classification is
     mostly independent of how hard the sound was played. Loudness is checked
     separately by the detector.
     """
@@ -217,7 +290,7 @@ def feature_vector(segment: np.ndarray, sample_rate: int) -> np.ndarray:
     else:
         envelope = np.interp(new_axis, np.linspace(0.0, 1.0, len(envelope)), envelope)
 
-    # Weight the attack/decay shape enough to matter alongside the time-varying
+    # Weight the short attack shape enough to matter alongside the time-varying
     # spectrum. Do not L2-normalize: absolute feature distance is used for a
     # stricter nearest-template comparison.
     result = np.concatenate([spectral.ravel(), (3.0 * envelope).astype(np.float32)])
@@ -249,7 +322,9 @@ class Profile:
     @classmethod
     def from_dict(cls, data: dict) -> "Profile":
         if data.get("version") != PROFILE_VERSION:
-            raise ValueError("Unsupported or missing profile version")
+            raise ValueError(
+                "Profile was made by an older detector version; re-enroll the audio examples"
+            )
         templates = np.asarray(data["templates"], dtype=np.float32)
         mean = np.asarray(data["mean"], dtype=np.float32)
         std = np.asarray(data["std"], dtype=np.float32)
@@ -299,16 +374,23 @@ def enroll(
     """Build a profile from positive and optional negative recordings."""
 
     templates = []
+    tail_templates = []
     paths = list(files)
     if not paths:
         raise RuntimeError("At least one example recording is required")
 
     for path in paths:
         audio = load_audio(path, sample_rate)
-        segment, peak_sample = extract_transient(audio, sample_rate, clip_seconds, pre_seconds)
+        segment, peak_sample = extract_attack(audio, sample_rate, clip_seconds, pre_seconds)
         templates.append(feature_vector(segment, sample_rate))
+        tail_start = peak_sample + round(sample_rate * ATTACK_TAIL_SECONDS)
+        tail_end = tail_start + round(sample_rate * clip_seconds)
+        tail = audio[max(0, tail_start) : min(len(audio), tail_end)]
+        tail = np.pad(tail, (max(0, -tail_start), max(0, tail_end - len(audio))))
+        if len(tail):
+            tail_templates.append(feature_vector(tail[: round(sample_rate * clip_seconds)], sample_rate))
         print(
-            f"Enrolled {path} (loudest transient at {peak_sample / sample_rate:.3f}s, "
+            f"Enrolled {path} (attack at {peak_sample / sample_rate:.3f}s, "
             f"level {dbfs(float(np.sqrt(np.mean(segment * segment)))):.1f} dBFS)"
         )
 
@@ -318,13 +400,13 @@ def enroll(
     if mean_norm > 1e-8:
         mean /= mean_norm
     std = np.std(matrix, axis=0).astype(np.float32)
-    negative_templates = []
+    negative_templates = list(tail_templates)
     for path in negative_files:
         audio = load_audio(path, sample_rate)
-        segment, peak_sample = extract_transient(audio, sample_rate, clip_seconds, pre_seconds)
+        segment, peak_sample = extract_attack(audio, sample_rate, clip_seconds, pre_seconds)
         negative_templates.append(feature_vector(segment, sample_rate))
         print(
-            f"Enrolled rejection example {path} (loudest transient at "
+            f"Enrolled rejection example {path} (attack at "
             f"{peak_sample / sample_rate:.3f}s)"
         )
     negative_matrix = (
@@ -442,7 +524,7 @@ def calibrate_microphone(
                     f"rise={peak_level - floor_level:.1f} dB). Please retry."
                 )
                 continue
-            segment, peak_sample = extract_transient(
+            segment, peak_sample = extract_attack(
                 audio,
                 profile.sample_rate,
                 profile.clip_seconds,
@@ -452,7 +534,7 @@ def calibrate_microphone(
             save_profile(profile, profile_path)
             added += 1
             print(
-                f"Added example {added}/{count}: peak at {peak_sample / profile.sample_rate:.3f}s, "
+                f"Added example {added}/{count}: attack at {peak_sample / profile.sample_rate:.3f}s, "
                 f"level={peak_level:.1f} dBFS, rise={peak_level - floor_level:.1f} dB"
             )
     except KeyboardInterrupt:
@@ -574,6 +656,10 @@ def detect_file(
     frame_samples = max(1, round(profile.sample_rate * 0.025))
     hop_samples = max(1, round(profile.sample_rate * 0.010))
     levels = np.array([dbfs(value) for value in frame_rms(audio, frame_samples, hop_samples)])
+    strengths = onset_strength(audio, profile.sample_rate)
+    onset_hop = max(1, round(profile.sample_rate * ATTACK_HOP_SECONDS))
+    onset_frame = max(1, round(profile.sample_rate * ATTACK_FRAME_SECONDS))
+    onset_threshold = _onset_threshold(strengths)
     noise_floor = float(np.percentile(levels, 20))
     min_gap_samples = round(profile.sample_rate * min_gap_ms / 1000.0)
     last_hit = -min_gap_samples
@@ -581,12 +667,14 @@ def detect_file(
     clip_samples = round(profile.sample_rate * profile.clip_seconds)
     detections = 0
 
-    for frame_number, level in enumerate(levels):
-        sample = frame_number * hop_samples + frame_samples // 2
+    for onset_number, strength in enumerate(strengths):
+        sample = onset_number * onset_hop + onset_frame // 2
+        level_number = min(len(levels) - 1, max(0, round(sample / hop_samples)))
+        level = float(levels[level_number])
         if sample - last_hit < min_gap_samples:
             continue
-        history_start = max(0, frame_number - 6)
-        previous_levels = levels[history_start:frame_number]
+        history_start = max(0, level_number - 6)
+        previous_levels = levels[history_start:level_number]
         recent_floor = float(np.min(previous_levels)) if len(previous_levels) else noise_floor
         measured_rise = level - recent_floor
         within_post_hit_window = (
@@ -595,9 +683,15 @@ def detect_file(
         )
         required_rise = max(rise_db, post_hit_rise_db) if within_post_hit_window else rise_db
         fresh_attack = measured_rise >= required_rise
-        local_end = min(len(levels), frame_number + 3)
-        is_local_peak = level >= float(np.max(levels[frame_number:local_end]))
-        if not fresh_attack or not is_local_peak or level < min_dbfs or level < noise_floor + jump_db:
+        local_end = min(len(strengths), onset_number + 4)
+        is_local_peak = strength >= float(np.max(strengths[onset_number:local_end]))
+        if (
+            strength < onset_threshold
+            or not fresh_attack
+            or not is_local_peak
+            or level < min_dbfs
+            or level < noise_floor + jump_db
+        ):
             continue
 
         start = sample - pre_samples
@@ -699,7 +793,7 @@ class LiveDetector:
             candidate.audio = np.concatenate([candidate.audio, block])
             if len(candidate.audio) >= self.context_samples:
                 context = candidate.audio[: self.context_samples]
-                segment, peak_in_context = extract_transient(
+                segment, peak_in_context = extract_attack(
                     context,
                     self.profile.sample_rate,
                     self.profile.clip_seconds,
@@ -757,7 +851,20 @@ class LiveDetector:
         fresh_attack = measured_rise >= required_rise
         cooldown_over = trigger_sample - self.last_trigger_sample >= self.min_gap_samples
         warmup_complete = self.total_samples >= self.warmup_samples
-        if warmup_complete and enough_volume and above_noise and fresh_attack and cooldown_over:
+        recent_audio = self._ring_tail(min(len(self.ring), self.context_pre_samples + len(block)))
+        recent_strength = onset_strength(recent_audio, self.profile.sample_rate)
+        attack_evidence = bool(
+            len(recent_strength)
+            and np.max(recent_strength[-3:]) >= _onset_threshold(recent_strength)
+        )
+        if (
+            warmup_complete
+            and enough_volume
+            and above_noise
+            and fresh_attack
+            and attack_evidence
+            and cooldown_over
+        ):
             self.last_trigger_sample = trigger_sample
             initial_audio = self._ring_tail(self.context_pre_samples)
             self.pending_candidates.append(
